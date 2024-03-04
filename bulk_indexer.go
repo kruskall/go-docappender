@@ -18,6 +18,7 @@
 package docappender
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -145,7 +146,7 @@ func newBulkIndexer(client *elasticsearch.Client, compressionLevel int, maxDocRe
 	}
 	if compressionLevel != gzip.NoCompression {
 		b.gzipw, _ = gzip.NewWriterLevel(&b.buf, compressionLevel)
-		b.writer = b.gzipw
+		b.writer = bufio.NewWriterSize(b.gzipw, 2*1024*1024)
 	} else {
 		b.writer = &b.buf
 	}
@@ -221,6 +222,10 @@ func (b *bulkIndexer) writeMeta(index, documentID string) {
 func (b *bulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error) {
 	if b.itemsAdded == 0 {
 		return BulkIndexerResponseStat{}, nil
+	}
+
+	if bw, ok := b.writer.(*bufio.Writer); ok {
+		bw.Flush()
 	}
 
 	if b.gzipw != nil {
