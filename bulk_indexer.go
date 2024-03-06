@@ -20,7 +20,6 @@ package docappender
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -34,6 +33,7 @@ import (
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esapi"
 	jsoniter "github.com/json-iterator/go"
+	gzip "github.com/klauspost/pgzip"
 )
 
 // At the time of writing, the go-elasticsearch BulkIndexer implementation
