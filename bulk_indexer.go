@@ -138,7 +138,7 @@ func init() {
 	})
 }
 
-func newBulkIndexer(client *elasticsearch.Client, compressionLevel int, maxDocRetry int) *bulkIndexer {
+func newBulkIndexer(client *elasticsearch.Client, compressionLevel int, maxDocRetry int, compressionBytes int) *bulkIndexer {
 	b := &bulkIndexer{
 		client:           client,
 		maxDocumentRetry: maxDocRetry,
@@ -146,7 +146,11 @@ func newBulkIndexer(client *elasticsearch.Client, compressionLevel int, maxDocRe
 	}
 	if compressionLevel != gzip.NoCompression {
 		b.gzipw, _ = gzip.NewWriterLevel(&b.buf, compressionLevel)
-		b.writer = bufio.NewWriterSize(b.gzipw, 2*1024*1024)
+		if compressionBytes != 0 {
+			b.writer = bufio.NewWriterSize(b.gzipw, compressionBytes)
+		} else {
+			b.writer = b.gzipw
+		}
 	} else {
 		b.writer = &b.buf
 	}
