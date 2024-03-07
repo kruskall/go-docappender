@@ -82,7 +82,9 @@ type Appender struct {
 	errgroupContext       context.Context
 	cancelErrgroupContext context.CancelFunc
 	metrics               metrics
-	mu                    sync.Mutex
+	closedMu              sync.Mutex
+	mu                    sync.RWMutex
+	done                  bool
 	closed                chan struct{}
 }
 
@@ -132,6 +134,8 @@ func New(client *elasticsearch.Client, cfg Config) (*Appender, error) {
 		)
 	}
 
+	cfg.EnableV2 = true
+
 	ms, err := newMetrics(cfg)
 	if err != nil {
 		return nil, err
@@ -159,10 +163,21 @@ func New(client *elasticsearch.Client, cfg Config) (*Appender, error) {
 		context.Background(),
 	)
 	indexer.scalingInfo.Store(scalingInfo{activeIndexers: 1})
-	indexer.errgroup.Go(func() error {
-		indexer.runActiveIndexer()
-		return nil
-	})
+	if !cfg.EnableV2 {
+		indexer.errgroup.Go(func() error {
+			indexer.runActiveIndexer()
+			return nil
+		})
+	} else {
+		for i := 0; i < cfg.MaxRequests; i++ {
+			indexer.errgroup.Go(func() error {
+				bi := <-indexer.available
+				indexer.runV2Indexer(bi)
+				indexer.available <- bi
+				return nil
+			})
+		}
+	}
 	return indexer, nil
 }
 
@@ -172,8 +187,8 @@ func New(client *elasticsearch.Client, cfg Config) (*Appender, error) {
 // lifetime returned an error. If ctx is cancelled, Close returns and
 // any ongoing flush attempts are cancelled.
 func (a *Appender) Close(ctx context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.closedMu.Lock()
+	defer a.closedMu.Unlock()
 	select {
 	case <-a.closed:
 		return a.errgroup.Wait()
@@ -189,13 +204,18 @@ func (a *Appender) Close(ctx context.Context) error {
 		<-ctx.Done()
 	}()
 
+	a.mu.Lock()
+	a.done = true
+	close(a.bulkItems)
+	a.mu.Unlock()
+
 	if err := a.errgroup.Wait(); err != nil {
 		return err
 	}
 	close(a.available)
 	var errs []error
 	for bi := range a.available {
-		if err := a.flush(context.Background(), bi); err != nil {
+		if err := a.flush(ctx, bi); err != nil {
 			errs = append(errs, fmt.Errorf("indexer failed: %w", err))
 		}
 	}
@@ -239,6 +259,13 @@ func (a *Appender) Add(ctx context.Context, index string, document io.WriterTo) 
 		return errMissingBody
 	}
 
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.done {
+		return ErrClosed
+	}
+
 	// Send the bulkIndexerItem to the internal channel, allowing individual
 	// documents to be processed by an active bulk indexer in a dedicated
 	// goroutine, improving data locality and minimising lock contention.
@@ -249,8 +276,6 @@ func (a *Appender) Add(ctx context.Context, index string, document io.WriterTo) 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-a.closed:
-		return ErrClosed
 	case a.bulkItems <- item:
 	}
 	a.addCount(1, &a.docsAdded, a.metrics.docsAdded)
@@ -412,6 +437,76 @@ func (a *Appender) flush(ctx context.Context, bulkIndexer *bulkIndexer) error {
 		zap.Int64("docs_rate_limited", tooManyRequests),
 	)
 	return nil
+}
+
+func (a *Appender) runV2Indexer(bi *bulkIndexer) {
+	flushTimer := time.NewTimer(a.config.FlushInterval)
+	var firstDocTS time.Time
+	var mu sync.Mutex
+	done := false
+	attrs := metric.WithAttributeSet(a.config.MetricAttributes)
+
+	flush := func() {
+		old := firstDocTS
+		firstDocTS = time.Time{}
+
+		var err error
+		took := timeFunc(func() {
+			err = a.flush(a.errgroupContext, bi)
+		})
+		bi.Reset()
+		if err != nil {
+			a.config.Logger.Error("failed to flush bulk indexer", zap.Error(err))
+		}
+		a.metrics.flushDuration.Record(context.Background(), took.Seconds(),
+			attrs,
+		)
+		a.metrics.bufferDuration.Record(context.Background(),
+			time.Since(old).Seconds(), attrs,
+		)
+	}
+
+	go func() {
+		for range flushTimer.C {
+			mu.Lock()
+			if done {
+				mu.Unlock()
+				return
+			}
+			flush()
+			mu.Unlock()
+		}
+	}()
+
+	for item := range a.bulkItems {
+		mu.Lock()
+
+		if firstDocTS.IsZero() {
+			firstDocTS = time.Now()
+
+			if !flushTimer.Stop() {
+				select {
+				case <-flushTimer.C:
+				default:
+				}
+			}
+			flushTimer.Reset(a.config.FlushInterval)
+		}
+
+		if err := bi.add(item); err != nil {
+			a.config.Logger.Error("failed to add item to bulk indexer", zap.Error(err))
+		}
+
+		if bi.Len() > a.config.FlushBytes {
+			flush()
+		}
+
+		mu.Unlock()
+	}
+
+	mu.Lock()
+	done = true
+	mu.Unlock()
 }
 
 // runActiveIndexer starts a new active indexer which pulls items from the

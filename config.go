@@ -49,6 +49,8 @@ type Config struct {
 	// default compression level.
 	CompressionLevel int
 
+	EnableV2 bool
+
 	// MaxRequests holds the maximum number of bulk index requests to execute concurrently.
 	// The maximum memory usage of Appender is thus approximately MaxRequests*FlushBytes.
 	//
